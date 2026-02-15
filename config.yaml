@@ -1,0 +1,38 @@
+# Demand forecasting pipeline configuration
+
+data:
+  date_column: date
+  store_column: store_id
+  target_column: sales
+  date_format: null  # null = infer automatically
+
+features:
+  lag_days: [1, 7, 14, 28]
+  rolling_windows: [7, 14, 28]
+  include_date_features: true  # day_of_week, month, etc.
+
+train:
+  test_size_ratio: 0.2  # last 20% of time for test
+  val_size_ratio: 0.1   # before test: 10% for validation
+  random_state: 42
+
+model:
+  type: xgboost  # xgboost | sklearn (RandomForest)
+  xgboost:
+    n_estimators: 200
+    max_depth: 6
+    learning_rate: 0.1
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_weight: 3
+    random_state: 42
+  sklearn:
+    n_estimators: 100
+    max_depth: 10
+    random_state: 42
+
+paths:
+  data_raw: data/raw/sales.csv
+  data_processed: data/processed/features.parquet
+  model_artifact: models/model.joblib
+  metrics_output: reports/metrics.json
