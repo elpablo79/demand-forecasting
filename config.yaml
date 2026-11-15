@@ -1,4 +1,5 @@
-# Demand forecasting pipeline configuration
+# Demand forecasting pipeline configuration.
+# Any key left out falls back to the defaults in src/config.py.
 
 data:
   date_column: date
@@ -9,17 +10,19 @@ data:
 features:
   lag_days: [1, 7, 14, 28]
   rolling_windows: [7, 14, 28]
-  include_date_features: true  # day_of_week, month, etc.
+  rolling_stats: [mean, std, min, max]
+  include_date_features: true  # day of week/month/year, week of year, month, weekend
+  holidays: []  # e.g. ["2023-12-25", "2024-01-01"]; adds an is_holiday feature
 
 train:
-  test_size_ratio: 0.2  # last 20% of time for test
-  val_size_ratio: 0.1   # before test: 10% for validation
-  random_state: 42
+  test_size_ratio: 0.2  # last 20% of dates for test
+  val_size_ratio: 0.1   # the 10% of dates before test, for early stopping
+  early_stopping_rounds: 50  # xgboost only
 
 model:
   type: xgboost  # xgboost | sklearn (RandomForest)
   xgboost:
-    n_estimators: 200
+    n_estimators: 1000  # upper bound; early stopping picks the actual number
     max_depth: 6
     learning_rate: 0.1
     subsample: 0.8
@@ -30,6 +33,11 @@ model:
     n_estimators: 100
     max_depth: 10
     random_state: 42
+
+evaluation:
+  horizon: 14             # days ahead to forecast in the backtest (and default for predict)
+  backtest_step_days: 7   # days between backtest forecast origins
+  seasonal_period: 7      # baseline: "same day last week"
 
 paths:
   data_raw: data/raw/sales.csv

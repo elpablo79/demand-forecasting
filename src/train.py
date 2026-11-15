@@ -1,161 +1,121 @@
 """Training pipeline for demand forecasting."""
 
+from __future__ import annotations
+
+import argparse
+import logging
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
-import joblib
-import numpy as np
 import pandas as pd
-import yaml
 
+from src.config import load_config
 from src.features import (
+    Columns,
+    FeatureSpec,
     build_features,
-    get_feature_columns,
-    load_raw_data,
+    complete_rows,
+    feature_columns,
+    fit_store_mapping,
+    load_dataset,
     save_processed,
 )
+from src.model import Artifact, fit_model
+
+logger = logging.getLogger(__name__)
 
 
-def load_config(path: str | Path = "config.yaml") -> dict[str, Any]:
-    """Load YAML config with sensible defaults."""
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config not found: {path}")
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+@dataclass(frozen=True)
+class SplitDates:
+    """Train is ``date < val_start``, val is ``val_start <= date < test_start``, test is the rest."""
+
+    val_start: pd.Timestamp
+    test_start: pd.Timestamp
 
 
-def time_based_split(
-    df: pd.DataFrame,
-    date_column: str,
-    test_ratio: float = 0.2,
-    val_ratio: float = 0.1,
-    random_state: int | None = None,
+def compute_split_dates(dates: pd.Series, test_ratio: float, val_ratio: float) -> SplitDates:
+    """Split on unique calendar dates so no date is shared between train, val and test."""
+    unique = pd.Series(dates.unique()).sort_values(ignore_index=True)
+    n = len(unique)
+    n_test = max(1, int(n * test_ratio))
+    n_val = int(n * val_ratio)
+    n_train = n - n_test - n_val
+    if n_train < 1:
+        raise ValueError(f"Not enough dates ({n}) for the requested split ratios")
+    return SplitDates(val_start=unique[n_train], test_start=unique[n_train + n_val])
+
+
+def split_by_dates(
+    df: pd.DataFrame, date_col: str, split: SplitDates
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Split by time: train = first (1 - test - val), val = next val, test = last test.
-    """
-    df = df.sort_values(date_column).reset_index(drop=True)
-    n = len(df)
-    test_size = int(n * test_ratio)
-    val_size = int(n * val_ratio)
-    train_size = n - test_size - val_size
-
-    train_df = df.iloc[:train_size]
-    val_df = df.iloc[train_size : train_size + val_size]
-    test_df = df.iloc[train_size + val_size :]
-    return train_df, val_df, test_df
+    d = df[date_col]
+    return (
+        df[d < split.val_start],
+        df[(d >= split.val_start) & (d < split.test_start)],
+        df[d >= split.test_start],
+    )
 
 
-def get_model(config: dict[str, Any]):
-    """Instantiate model from config."""
-    model_cfg = config.get("model", {})
-    model_type = model_cfg.get("type", "xgboost")
-
-    if model_type == "xgboost":
-        import xgboost as xgb
-
-        params = model_cfg.get("xgboost", {})
-        return xgb.XGBRegressor(
-            n_estimators=params.get("n_estimators", 200),
-            max_depth=params.get("max_depth", 6),
-            learning_rate=params.get("learning_rate", 0.1),
-            subsample=params.get("subsample", 0.8),
-            colsample_bytree=params.get("colsample_bytree", 0.8),
-            min_child_weight=params.get("min_child_weight", 3),
-            random_state=params.get("random_state", 42),
-        )
-    if model_type == "sklearn":
-        from sklearn.ensemble import RandomForestRegressor
-
-        params = model_cfg.get("sklearn", {})
-        return RandomForestRegressor(
-            n_estimators=params.get("n_estimators", 100),
-            max_depth=params.get("max_depth", 10),
-            random_state=params.get("random_state", 42),
-        )
-    raise ValueError(f"Unknown model type: {model_type}")
-
-
-def train(
-    config_path: str | Path = "config.yaml",
-    data_path: str | Path | None = None,
-) -> tuple[Any, list[str], Any, dict[str, Any]]:
-    """
-    Run full training pipeline: load config and data, build features,
-    time-based split, train model, save artifact. Returns (model, feature_columns, store_encoder, config).
-    """
+def train(config_path: str | Path = "config.yaml", data_path: str | Path | None = None) -> Artifact:
+    """Load data, build features, fit on the train split and save the artifact."""
     config = load_config(config_path)
-    paths = config.get("paths", {})
-    data_cfg = config.get("data", {})
-    train_cfg = config.get("train", {})
-    feat_cfg = config.get("features", {})
+    cols = Columns.from_config(config)
+    spec = FeatureSpec.from_config(config)
+    paths = config["paths"]
 
-    data_path = data_path or paths.get("data_raw", "data/raw/sales.csv")
-    date_col = data_cfg.get("date_column", "date")
-    store_col = data_cfg.get("store_column", "store_id")
-    target_col = data_cfg.get("target_column", "sales")
-    date_fmt = data_cfg.get("date_format") or None
-
-    df = load_raw_data(data_path, date_column=date_col, date_format=date_fmt)
-    df, store_encoder = build_features(
-        df,
-        date_column=date_col,
-        store_column=store_col,
-        target_column=target_col,
-        lag_days=feat_cfg.get("lag_days", [1, 7, 14, 28]),
-        rolling_windows=feat_cfg.get("rolling_windows", [7, 14, 28]),
-        include_date_features=feat_cfg.get("include_date_features", True),
-        store_encoder=None,
+    grid = load_dataset(config, data_path)
+    split = compute_split_dates(
+        grid[cols.date], config["train"]["test_size_ratio"], config["train"]["val_size_ratio"]
     )
 
-    feature_columns = get_feature_columns(config, store_column=store_col, target_column=target_col)
-    # Ensure we only use columns that exist
-    feature_columns = [c for c in feature_columns if c in df.columns]
+    # Fit the store encoding on training dates only.
+    store_mapping = fit_store_mapping(grid.loc[grid[cols.date] < split.val_start, cols.store])
 
-    train_df, val_df, test_df = time_based_split(
-        df,
-        date_column=date_col,
-        test_ratio=train_cfg.get("test_size_ratio", 0.2),
-        val_ratio=train_cfg.get("val_size_ratio", 0.1),
-        random_state=train_cfg.get("random_state"),
+    # Features only look at the past, so building them before splitting does not leak.
+    feats = build_features(grid, spec, cols, store_mapping)
+    feat_cols = feature_columns(spec, cols)
+    usable = complete_rows(feats, feat_cols, cols.target)
+    train_df, val_df, test_df = split_by_dates(usable, cols.date, split)
+    logger.info(
+        "Split rows: train=%d val=%d test=%d (val from %s, test from %s)",
+        len(train_df),
+        len(val_df),
+        len(test_df),
+        split.val_start.date(),
+        split.test_start.date(),
     )
+    if train_df.empty:
+        raise ValueError("No training rows left after removing each store's warm-up period")
 
-    X_train = train_df[feature_columns].astype(np.float32)
-    y_train = train_df[target_col]
-    X_val = val_df[feature_columns].astype(np.float32)
-    y_val = val_df[target_col]
+    model = fit_model(config, train_df, val_df, feat_cols, cols.target)
+    best = getattr(model, "best_iteration", None)
+    if best is not None:
+        logger.info("Early stopping chose %d trees", best + 1)
 
-    model = get_model(config)
-    fit_kwargs: dict[str, Any] = {}
-    if config.get("model", {}).get("type") == "xgboost":
-        fit_kwargs["eval_set"] = [(X_val, y_val)]
-        fit_kwargs["verbose"] = False
-    model.fit(X_train, y_train, **fit_kwargs)
+    artifact = Artifact(
+        model=model,
+        feature_columns=feat_cols,
+        store_mapping=store_mapping,
+        config=config,
+        val_start=split.val_start,
+        test_start=split.test_start,
+    )
+    artifact.save(paths["model_artifact"])
+    logger.info("Model saved to %s", paths["model_artifact"])
 
-    artifact_path = paths.get("model_artifact", "models/model.joblib")
-    Path(artifact_path).parent.mkdir(parents=True, exist_ok=True)
-    artifact = {
-        "model": model,
-        "feature_columns": feature_columns,
-        "store_encoder": store_encoder,
-        "config": config,
-        "date_column": date_col,
-        "store_column": store_col,
-        "target_column": target_col,
-    }
-    joblib.dump(artifact, artifact_path)
+    if paths.get("data_processed"):
+        save_processed(feats, paths["data_processed"])
 
-    processed_path = paths.get("data_processed")
-    if processed_path:
-        save_processed(df, processed_path)
-
-    return model, feature_columns, store_encoder, config
+    return artifact
 
 
 def main() -> None:
-    """CLI entrypoint."""
-    train()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    parser = argparse.ArgumentParser(description="Train the demand forecasting model")
+    parser.add_argument("--config", default="config.yaml", help="Path to config YAML")
+    parser.add_argument("--data", default=None, help="Raw data CSV (default from config)")
+    args = parser.parse_args()
+    train(args.config, args.data)
 
 
 if __name__ == "__main__":

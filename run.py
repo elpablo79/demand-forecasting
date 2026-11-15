@@ -1,30 +1,29 @@
-"""Run full pipeline: train then evaluate (reproducible)."""
+"""Run the full pipeline: train, then evaluate."""
 
+import argparse
+import logging
+import os
 import sys
 from pathlib import Path
 
-# Run from project root (where run.py lives) so config and data paths resolve
+# Resolve config and data paths relative to the project root, wherever this is run from.
 _PROJECT_ROOT = Path(__file__).resolve().parent
-if Path.cwd() != _PROJECT_ROOT:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-    import os
-    os.chdir(_PROJECT_ROOT)
+sys.path.insert(0, str(_PROJECT_ROOT))
+os.chdir(_PROJECT_ROOT)
 
-from src.train import train
-from src.evaluate import evaluate
+from src.evaluate import evaluate, summarize  # noqa: E402
+from src.train import train  # noqa: E402
 
 
 def main() -> None:
-    config_path = Path("config.yaml")
-    artifact_path = Path("models/model.joblib")
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    parser = argparse.ArgumentParser(description="Train and evaluate the demand forecasting model")
+    parser.add_argument("--config", default="config.yaml", help="Path to config YAML")
+    args = parser.parse_args()
 
-    print("Training...")
-    train(config_path=config_path)
-    print(f"Model saved to {artifact_path}")
-
-    print("Evaluating...")
-    metrics = evaluate(artifact_path, data_path=None, config_path=config_path)
-    print("Metrics:", metrics)
+    artifact = train(config_path=args.config)
+    report = evaluate(artifact.config["paths"]["model_artifact"])
+    print(summarize(report))
 
 
 if __name__ == "__main__":

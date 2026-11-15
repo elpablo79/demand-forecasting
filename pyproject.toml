@@ -1,0 +1,24 @@
+[project]
+name = "demand-forecasting"
+version = "0.2.0"
+description = "Reproducible daily demand forecasting pipeline"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "PD", "NPY", "RUF"]
+
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src", "run.py"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+check_untyped_defs = true

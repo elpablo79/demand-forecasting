@@ -1,150 +1,202 @@
-"""Feature engineering for demand forecasting."""
+"""Data loading and feature engineering for demand forecasting.
 
+All features for date ``t`` are computed only from target values strictly before
+``t``, so they are safe to use for forecasting and when building them on the full
+history before a time-based split.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
+logger = logging.getLogger(__name__)
 
-def load_raw_data(
-    path: str | Path,
-    date_column: str = "date",
-    date_format: str | None = None,
-) -> pd.DataFrame:
-    """Load raw sales data and ensure correct dtypes and order."""
+UNKNOWN_STORE = -1
+
+
+@dataclass(frozen=True)
+class Columns:
+    date: str = "date"
+    store: str = "store_id"
+    target: str = "sales"
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> Columns:
+        d = config["data"]
+        return cls(date=d["date_column"], store=d["store_column"], target=d["target_column"])
+
+
+@dataclass(frozen=True)
+class FeatureSpec:
+    lag_days: tuple[int, ...]
+    rolling_windows: tuple[int, ...]
+    rolling_stats: tuple[str, ...]
+    include_date_features: bool
+    holidays: tuple[pd.Timestamp, ...]
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> FeatureSpec:
+        f = config["features"]
+        return cls(
+            lag_days=tuple(sorted(f["lag_days"])),
+            rolling_windows=tuple(sorted(f["rolling_windows"])),
+            rolling_stats=tuple(f["rolling_stats"]),
+            include_date_features=bool(f["include_date_features"]),
+            holidays=tuple(pd.to_datetime(h).normalize() for h in f["holidays"]),
+        )
+
+    @property
+    def history_days(self) -> int:
+        """Days of past data needed to compute every feature for one date."""
+        return max(*self.lag_days, *self.rolling_windows)
+
+
+DATE_FEATURES = ["day_of_week", "day_of_month", "month", "day_of_year", "week_of_year", "is_weekend"]
+
+
+def feature_columns(spec: FeatureSpec, cols: Columns) -> list[str]:
+    """Names of the model input columns, in a fixed order."""
+    names = [f"{cols.target}_lag_{lag}" for lag in spec.lag_days]
+    names += [
+        f"{cols.target}_rolling_{stat}_{w}" for w in spec.rolling_windows for stat in spec.rolling_stats
+    ]
+    names.append(f"{cols.store}_encoded")
+    if spec.include_date_features:
+        names += DATE_FEATURES
+    if spec.holidays:
+        names.append("is_holiday")
+    return names
+
+
+def load_raw_data(path: str | Path, cols: Columns, date_format: str | None = None) -> pd.DataFrame:
+    """Load raw sales data, validate it and return it sorted by (store, date)."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Data file not found: {path}")
-
     df = pd.read_csv(path)
-
-    if date_column not in df.columns:
-        raise ValueError(f"Column '{date_column}' not found. Got: {list(df.columns)}")
-
-    df[date_column] = pd.to_datetime(df[date_column], format=date_format)
-    df = df.sort_values([date_column, "store_id"]).reset_index(drop=True)
-    return df
+    return prepare_raw(df, cols, date_format)
 
 
-def build_lag_features(
-    df: pd.DataFrame,
-    group_col: str,
-    value_col: str,
-    lags: list[int],
-) -> pd.DataFrame:
-    """Add lag features per group (e.g. per store)."""
-    out = df.copy()
-    for lag in lags:
-        out[f"{value_col}_lag_{lag}"] = out.groupby(group_col)[value_col].shift(lag)
-    return out
+def prepare_raw(df: pd.DataFrame, cols: Columns, date_format: str | None = None) -> pd.DataFrame:
+    """Validate columns, parse dates, check for duplicates and sort by (store, date)."""
+    missing = {cols.date, cols.store, cols.target} - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing columns {sorted(missing)}. Got: {list(df.columns)}")
+
+    df = df.copy()
+    df[cols.date] = pd.to_datetime(df[cols.date], format=date_format).dt.normalize()
+    df[cols.store] = df[cols.store].astype(str)
+    df[cols.target] = pd.to_numeric(df[cols.target], errors="raise").astype(float)
+
+    dupes = df.duplicated([cols.store, cols.date])
+    if dupes.any():
+        raise ValueError(f"{int(dupes.sum())} duplicate ({cols.store}, {cols.date}) rows in data")
+
+    return df.sort_values([cols.store, cols.date], kind="stable").reset_index(drop=True)
 
 
-def build_rolling_features(
-    df: pd.DataFrame,
-    group_col: str,
-    value_col: str,
-    windows: list[int],
-) -> pd.DataFrame:
-    """Add rolling mean features per group."""
-    out = df.copy()
-    for w in windows:
-        out[f"{value_col}_rolling_mean_{w}"] = (
-            out.groupby(group_col)[value_col]
-            .transform(lambda x: x.shift(1).rolling(window=w, min_periods=1).mean())
+def fill_missing_dates(df: pd.DataFrame, cols: Columns) -> pd.DataFrame:
+    """Reindex each store to a complete daily calendar, leaving missing targets as NaN.
+
+    Lags are computed with row shifts, so without this a gap in the data would make
+    "lag 7" silently point to a different day.
+    """
+    parts = []
+    n_added = 0
+    for store, g in df.groupby(cols.store, sort=True):
+        full = pd.date_range(g[cols.date].min(), g[cols.date].max(), freq="D", name=cols.date)
+        g = g.set_index(cols.date).reindex(full)
+        n_added += int(g[cols.store].isna().sum())
+        g[cols.store] = store
+        parts.append(g.reset_index())
+    if n_added:
+        logger.warning("Filled %d missing (store, date) rows with NaN %s", n_added, cols.target)
+    out = pd.concat(parts, ignore_index=True)
+    return out.sort_values([cols.store, cols.date], kind="stable").reset_index(drop=True)
+
+
+def fit_store_mapping(stores: pd.Series) -> dict[str, int]:
+    """Map each store id (as string) to a stable integer code."""
+    return {s: i for i, s in enumerate(sorted(stores.astype(str).unique()))}
+
+
+def encode_store(stores: pd.Series, mapping: dict[str, int]) -> pd.Series:
+    """Encode store ids with ``mapping``; unknown stores get UNKNOWN_STORE with a warning."""
+    encoded = stores.astype(str).map(mapping)
+    unknown = encoded.isna()
+    if unknown.any():
+        logger.warning(
+            "Stores not seen in training, encoded as %d: %s",
+            UNKNOWN_STORE,
+            sorted(stores[unknown].astype(str).unique()),
         )
-    return out
-
-
-def build_date_features(df: pd.DataFrame, date_column: str) -> pd.DataFrame:
-    """Add date-based features."""
-    out = df.copy()
-    d = pd.to_datetime(out[date_column])
-    out["day_of_week"] = d.dt.dayofweek
-    out["month"] = d.dt.month
-    out["year"] = d.dt.year
-    out["is_weekend"] = (d.dt.dayofweek >= 5).astype(int)
-    return out
-
-
-def encode_store(
-    df: pd.DataFrame,
-    store_column: str,
-    encoder: Any | None = None,
-) -> tuple[pd.DataFrame, Any]:
-    """
-    Encode store_id to integer. If encoder is provided, use it (transform);
-    otherwise fit a new one. Returns (dataframe with _encoded column, encoder).
-    """
-    from sklearn.preprocessing import LabelEncoder
-
-    le = encoder if encoder is not None else LabelEncoder()
-    col = df[store_column].astype(str)
-    if encoder is None:
-        encoded = le.fit_transform(col)
-    else:
-        # Unseen store_ids get -1
-        mapping = dict(zip(le.classes_, range(len(le.classes_))))
-        encoded = col.map(lambda x: mapping.get(x, -1)).values.astype(np.int64)
-    out = df.copy()
-    out[f"{store_column}_encoded"] = encoded
-    return out, le
+    return encoded.fillna(UNKNOWN_STORE).astype(int)
 
 
 def build_features(
     df: pd.DataFrame,
-    *,
-    date_column: str = "date",
-    store_column: str = "store_id",
-    target_column: str = "sales",
-    lag_days: list[int] | None = None,
-    rolling_windows: list[int] | None = None,
-    include_date_features: bool = True,
-    store_encoder: Any | None = None,
-) -> tuple[pd.DataFrame, Any]:
+    spec: FeatureSpec,
+    cols: Columns,
+    store_mapping: dict[str, int],
+    group_col: str | None = None,
+) -> pd.DataFrame:
+    """Add all features. ``df`` must be a complete daily grid sorted by (group, date).
+
+    Lags and rolling stats are computed within ``group_col`` (default: the store
+    column); forecasting uses a different grouping to run many histories at once.
+    Rows are never dropped here; use :func:`complete_rows` to select training rows.
     """
-    Full feature pipeline: lags, rolling, date features, store encoding.
-    Drops rows where lag/rolling create NaNs (initial period per store).
-    Returns (feature dataframe, store encoder used or fitted).
-    """
-    lag_days = lag_days or [1, 7, 14, 28]
-    rolling_windows = rolling_windows or [7, 14, 28]
+    group_col = group_col or cols.store
+    # Collect new columns and attach them in one concat (much faster than one insert each).
+    new: dict[str, Any] = {}
+    by_group = df.groupby(group_col, sort=False)[cols.target]
 
-    out = build_lag_features(df, store_column, target_column, lag_days)
-    out = build_rolling_features(out, store_column, target_column, rolling_windows)
+    for lag in spec.lag_days:
+        new[f"{cols.target}_lag_{lag}"] = by_group.shift(lag)
 
-    if include_date_features:
-        out = build_date_features(out, date_column)
+    shifted = by_group.shift(1).groupby(df[group_col], sort=False)
+    stats = list(spec.rolling_stats)
+    for w in spec.rolling_windows:
+        rolled = shifted.rolling(window=w, min_periods=1).agg(stats)
+        rolled = rolled.reset_index(level=0, drop=True)
+        for stat in stats:
+            new[f"{cols.target}_rolling_{stat}_{w}"] = rolled[stat]
 
-    out, store_encoder = encode_store(out, store_column, encoder=store_encoder)
+    new[f"{cols.store}_encoded"] = encode_store(df[cols.store], store_mapping)
 
-    # Drop rows with NaN from lags (first max(lag) days per store)
-    out = out.dropna(subset=[f"{target_column}_lag_{lag_days[0]}"]).reset_index(drop=True)
+    d = df[cols.date]
+    if spec.include_date_features:
+        new["day_of_week"] = d.dt.dayofweek
+        new["day_of_month"] = d.dt.day
+        new["month"] = d.dt.month
+        new["day_of_year"] = d.dt.dayofyear
+        new["week_of_year"] = d.dt.isocalendar().week.astype(int)
+        new["is_weekend"] = (d.dt.dayofweek >= 5).astype(int)
+    if spec.holidays:
+        new["is_holiday"] = d.isin(list(spec.holidays)).astype(int)
 
-    return out, store_encoder
+    return pd.concat([df, pd.DataFrame(new, index=df.index)], axis=1)
 
 
-def get_feature_columns(
-    config: dict[str, Any],
-    store_column: str = "store_id",
-    target_column: str = "sales",
-) -> list[str]:
-    """Return list of feature column names used for training (no date, no target)."""
-    lag_days = config.get("features", {}).get("lag_days", [1, 7, 14, 28])
-    rolling_windows = config.get("features", {}).get("rolling_windows", [7, 14, 28])
-    include_date = config.get("features", {}).get("include_date_features", True)
+def complete_rows(df: pd.DataFrame, feature_cols: list[str], target: str) -> pd.DataFrame:
+    """Rows with a known target and every feature available (drops each store's warm-up period)."""
+    return df.dropna(subset=[*feature_cols, target]).reset_index(drop=True)
 
-    cols = (
-        [f"{target_column}_lag_{l}" for l in lag_days]
-        + [f"{target_column}_rolling_mean_{w}" for w in rolling_windows]
-        + [f"{store_column}_encoded"]
-    )
-    if include_date:
-        cols += ["day_of_week", "month", "year", "is_weekend"]
-    return cols
+
+def load_dataset(config: dict[str, Any], data_path: str | Path | None = None) -> pd.DataFrame:
+    """Load raw data from config and fill it to a complete daily grid."""
+    cols = Columns.from_config(config)
+    path = data_path or config["paths"]["data_raw"]
+    raw = load_raw_data(path, cols, config["data"]["date_format"])
+    return fill_missing_dates(raw, cols)
 
 
 def save_processed(df: pd.DataFrame, path: str | Path) -> None:
-    """Save processed dataframe (e.g. Parquet) for reproducibility."""
+    """Save processed dataframe as Parquet for reproducibility."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path, index=False)
